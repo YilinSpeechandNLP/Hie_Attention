@@ -1,0 +1,160 @@
+import os
+import numpy as np
+from keras.callbacks import ModelCheckpoint
+from keras.preprocessing.text import Tokenizer
+from keras.layers import Dense, Input, Flatten
+from keras.layers import  Dropout, GRU, Bidirectional, TimeDistributed, LSTM
+from keras.models import Model
+from keras import regularizers
+from keras.utils.np_utils import to_categorical
+from nltk import tokenize
+from keras_bert import extract_embeddings, POOL_MAX
+from keras.preprocessing.sequence import pad_sequences
+from nltk.tokenize import sent_tokenize, word_tokenize
+from .defination import AttLayer
+#from keras_bert import Tokenizer
+#import keras
+#from keras_bert import get_base_dict, get_model, compile_model, gen_batch_inputs
+
+### self defined functions
+from src.functions import f1,rc,pr,clean_str
+from src.data_load import test_data_load
+from src.data_load import classification_data_load as load
+import pdb
+
+def bert_embedding_single_layer(texts,labels, trans_item, batch_size):
+    model_path = 'bert/datasets/multi_cased_L-12_H-768_A-12'
+    embeddings_padding = []
+    label_batch = []
+    for idx in range(batch_size):
+        print(idx)
+        text = texts[idx]
+        embed = extract_embeddings(model_path, text)
+        if len(embed)<trans_item.word_num_per_trans:
+            zero_padding = np.zeros(trans_item.word_num_per_trans-embed.shape[0],embed.shape[-1])
+            embed = np.concatenate([embed,zero_padding],axis = 0)
+        else:
+            embed = embed[:trans_item.word_num_per_trans,:]
+        embeddings_padding.append(embed)
+        label_batch.append(labels[idx])
+    return embeddings_padding, label_batch
+
+
+
+def bert_embedding_hie(texts, labels, trans_item,batch_size):
+    model_path = 'bert/datasets/multi_cased_L-12_H-768_A-12'
+    text_embeddings = []
+    label_batch = []
+    for idx in range(batch_size):
+        text = texts [idx]
+        sentences = sent_tokenize(text)
+        sents_embedding = extract_embeddings(model_path, sentences)
+        embeddings = np.zeros([trans_item.sent_nums, trans_item.word_num_per_sent, sents_embedding[0].shape[-1]])
+        if len(sents_embedding) > trans_item.sent_nums:
+            sents_embedding_tmp = sents_embedding[:trans_item.sent_nums-1,:,:]
+            sents_embedding_tmp.append(sents_embedding[-1,:,:])
+            sents_embedding = sents_embedding_tmp
+        idx = 0
+        for sent_embedding in sents_embedding:
+            if len(sent_embedding)<trans_item.word_num_per_sent:
+                zero_padding = np.zeros([trans_item.word_num_per_sent-sent_embedding.shape[0],sent_embedding.shape[-1]])
+                sent_embedding = np.concatenate([sent_embedding,zero_padding],axis = 0)
+            else:
+                sent_embedding = sent_embedding[:trans_item.word_num_per_sent,:]            
+            embeddings[idx]=sent_embedding
+            idx += 1
+        embeddings = np.asarray(embeddings)
+        text_embeddings.append(embeddings)
+        label_batch.append(labels[idx])
+    return text_embeddings, label_batch
+
+
+def embedding_generator(texts, labels, trans_item, model_item):
+    while True:
+        if model_item.model_type == 'Hie' or 'Hie_Att':
+            text_embedding_batch, label_batch = bert_embedding_hie(texts, labels, trans_item, model_item.batch_size)
+        else:
+            text_embedding_batch, label_batch = bert_embedding_single_layer(texts, labels, trans_item, model_item.batch_size)
+    yield text_embedding_batch, label_batch
+
+def bert_BiRNN_Att_Model(model_item):
+    sequence_input = Input(shape=(50,768), dtype='float32')
+    x = Bidirectional(LSTM(model_item.LSTM_DIM, return_sequences=True), merge_mode='sum')(sequence_input)
+    x = Dropout(model_item.drop_rate)(x)
+    x = AttLayer(model_item.Att_DIM, name = 'attention')(x)
+    preds = Dense(model_item.label_num, activation='softmax')(x)
+    model = Model(sequence_input, preds)
+    print(model.summary())
+    return model
+
+
+def bert_hie_model(model_item):
+    ############word-level#############
+    sentence_input = Input(shape=(30, 768), dtype='float32')
+    x = Bidirectional(LSTM(model_item.LSTM_DIM, return_sequences=True), merge_mode='sum')(sentence_input)
+    x = Dropout(model_item.drop_rate)(x)
+    x = Dense(model_item.Dense_DIM, activation='relu')(x)
+    output = AttLayer(model_item.Att_DIM)(x)
+    sentEncoder = Model(sentence_input, output)
+    print(sentEncoder.summary())
+    ############sentence-level: Bi-rnn############
+    review_input = Input(shape=(30,30,768), dtype='float32')
+    x = TimeDistributed(sentEncoder)(review_input)
+    x = Bidirectional(LSTM(model_item.LSTM_DIM, return_sequences=True), merge_mode='sum')(x)
+    x = Dropout(model_item.drop_rate)(x)
+    x = AttLayer(model_item.Att_DIM,name = 'attention')(x)
+    preds = Dense(model_item.label_num, activation='sigmoid', kernel_regularizer=regularizers.l2(model_item.l2))(x)
+    model = Model(review_input, preds)
+    print(model.summary())
+    return model
+
+
+def bert_classification_func(trans_item,model_item,path_item):
+    dev_accuracy = []
+    dev_f_score = []
+    for idx in range(model_item.Fold):
+        print('fold ' + str(idx))
+        path_item.res_f.write('fold: ' + str(idx) + '\n')
+        ### list prepare
+        train_lst_path = os.path.join(path_item.list_dir, str(idx), 'trans_train')
+        train_lists = open(train_lst_path).readlines()
+        dev_lst_path = os.path.join(path_item.list_dir, str(idx), 'trans_dev')
+        dev_lists = open(dev_lst_path).readlines()
+        # data load and prepare
+        train_labels, train_texts = load(train_lists, path_item.train_transcript_path)
+        dev_labels, dev_texts = load(dev_lists, path_item.train_transcript_path)
+        class_num = len(set(train_labels+ dev_labels)) # calculate the number of class in the data
+        train_labels = to_categorical(np.asarray(train_labels), class_num)
+        dev_labels = to_categorical(np.asarray(dev_labels), class_num)
+        
+        ## bert text to embedding vector
+        print('data generator initialization, done\n')
+        train_generator = embedding_generator(train_texts, train_labels, trans_item, model_item)
+        dev_generator = embedding_generator(dev_texts, dev_labels, trans_item, model_item)
+        
+        ## model initialization
+        print('model initialization\n')
+        if model_item.model_type == 'Hie' or model_item.model_type == 'Hie_Att':
+            model = bert_hie_model(model_item)
+        else:
+            model = bert_BiRNN_Att_Model(model_item)
+        model_folder_ex = os.path.join(path_item.model_folder,model_item.model_type)
+        if os.path.exists(model_folder_ex) == False:
+            os.makedirs(model_folder_ex)
+            
+        model_saved_path = os.path.join(model_folder_ex, str(idx))
+        checkpoint = ModelCheckpoint(model_saved_path, monitor='val_f1', verbose=2, save_best_only=True,
+                                         mode='max', save_weights_only=True)
+        model.compile(loss='binary_crossentropy',
+                          optimizer='adam',
+                          metrics=[pr, rc, f1, 'accuracy'])
+
+        model.fit_generator(train_generator, 
+                  steps_per_epoch=model_item.batch_size,
+                  epochs=model_item.epochs,
+                  validation_steps =  model_item.batch_size,
+                  validation_data=dev_generator,
+                  callbacks=[checkpoint],
+                  shuffle=True)
+                  
+        
