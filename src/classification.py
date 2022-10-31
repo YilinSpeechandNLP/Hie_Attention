@@ -3,7 +3,7 @@ import numpy as np
 from keras.callbacks import ModelCheckpoint
 from keras.preprocessing.text import Tokenizer
 from keras.utils.np_utils import to_categorical
-from gensim.models import Word2Vec
+
 import keras
 #from keras_bert import Tokenizer
 #import keras
